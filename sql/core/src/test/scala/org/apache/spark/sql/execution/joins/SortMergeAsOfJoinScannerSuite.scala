@@ -79,6 +79,36 @@ class SortMergeAsOfJoinScannerSuite extends SparkFunSuite with LocalSparkContext
     assert(evaluations == 0, s"evaluated the repeated part $evaluations times")
   }
 
+  gridTest("cursor scan checks a left-only residual once per left row with a candidate")(
+      Seq(Backward, Forward)) { direction =>
+    sc = new SparkContext("local", "SortMergeAsOfJoinScannerSuite", new SparkConf(false))
+    val scans = sc.parallelize(Seq(0), 1)
+      .mapPartitions { _ =>
+        val leftKey = AttributeReference("leftKey", IntegerType)()
+        val rightKey = AttributeReference("rightKey", IntegerType)()
+        val count = new AtomicInteger()
+        val residual = GreaterThan(CountedEvaluation(leftKey, count), Literal(50))
+        // Left row -5 has no backward candidate, and left row 105 has no forward candidate.
+        val (asOfCondition, leftKeys) = direction match {
+          case Backward => (GreaterThanOrEqual(leftKey, rightKey), -5 +: (5 to 95 by 10))
+          case _ => (LessThanOrEqual(leftKey, rightKey), (5 to 95 by 10) :+ 105)
+        }
+        Iterator.single(Seq(false, true).map { useCursorScan =>
+          count.set(0)
+          val scanner = newScanner(leftKey, rightKey, leftKeys, 0 to 100 by 10, asOfCondition,
+            Some(residual), direction, useCursorScan = useCursorScan)
+          (matchedRightKeys(scanner), count.get())
+        })
+      }.collect().head
+
+    // Only the left rows above 50 pass the residual.
+    val expected = if (direction == Backward) (50 to 90 by 10).toList else (60 to 100 by 10).toList
+    // The buffered scan checks the residual on each candidate it reads.
+    assert(scans.head == (expected, if (direction == Backward) 55 else 45))
+    // The cursor scan checks it once for each of the 10 left rows with a candidate.
+    assert(scans.last == (expected, 10))
+  }
+
   gridTest("as-of condition skips a repeated part behind a FALSE guard")(factoryModes) { mode =>
     sc = new SparkContext("local", "SortMergeAsOfJoinScannerSuite", new SparkConf(false))
     val (matchedKeys, evaluations) = sc.parallelize(Seq(0), 1)
@@ -216,6 +246,17 @@ class SortMergeAsOfJoinScannerSuite extends SparkFunSuite with LocalSparkContext
     val longR = AttributeReference("r", LongType)()
     assert(supportsCursorScan(
       Backward, GreaterThanOrEqual(longL, longR), None, Seq(longL), Seq(longR)))
+
+    // A residual that reads only left columns, or no column, has one value per left row.
+    val l2 = AttributeReference("l2", IntegerType)()
+    for {
+      residual <- Seq(GreaterThan(l2, Literal(0)), GreaterThan(Literal(2), Literal(1)))
+      (direction, condition) <-
+        Seq(Backward -> GreaterThanOrEqual(l, r), Forward -> LessThanOrEqual(l, r))
+    } {
+      assert(supportsCursorScan(direction, condition, Some(residual), Seq(l), Seq(r),
+        leftOutput = Seq(l, l2)), s"$direction $residual")
+    }
   }
 
   test("cursor scan accepts scalar sort keys except TIME, nanosecond timestamps and " +
@@ -245,9 +286,20 @@ class SortMergeAsOfJoinScannerSuite extends SparkFunSuite with LocalSparkContext
     val lcaseL = AttributeReference("l", StringType("UTF8_LCASE"))()
     val stringR = AttributeReference("r", StringType)()
     val backward = GreaterThanOrEqual(l, r)
+    val leftOutput = Seq(l, l2)
     Seq(
-      "a residual condition" ->
-        supportsCursorScan(Backward, backward, Some(LessThan(l2, r2)), Seq(l), Seq(r)),
+      "a residual that reads a right column" ->
+        supportsCursorScan(Backward, backward, Some(LessThan(l2, r2)), Seq(l), Seq(r), leftOutput),
+      "a residual that reads only right columns" ->
+        supportsCursorScan(Backward, backward, Some(GreaterThan(r2, Literal(0))), Seq(l), Seq(r),
+          leftOutput),
+      "a residual with a left-only part and a part that reads a right column" ->
+        supportsCursorScan(Backward, backward,
+          Some(And(GreaterThan(l2, Literal(0)), LessThan(l2, r2))), Seq(l), Seq(r), leftOutput),
+      // Checking it once per left row changes how often it runs.
+      "a nondeterministic residual that reads only left columns" ->
+        supportsCursorScan(Backward, backward,
+          Some(LessThan(Cast(l2, DoubleType), Rand(Literal(0L)))), Seq(l), Seq(r), leftOutput),
       "a nearest join" ->
         supportsCursorScan(Nearest, backward, None, Seq(l), Seq(r)),
       "a backward join with a forward comparison" ->
@@ -288,9 +340,13 @@ class SortMergeAsOfJoinScannerSuite extends SparkFunSuite with LocalSparkContext
       asOfCondition: Expression,
       residualCondition: Option[Expression],
       leftSortExprs: Seq[Expression],
-      rightSortExprs: Seq[Expression]): Boolean =
-    SortMergeAsOfJoinScanner.supportsCursorScan(
-      direction, asOfCondition, residualCondition, leftSortExprs, rightSortExprs)
+      rightSortExprs: Seq[Expression],
+      leftOutput: Seq[Attribute] = Nil): Boolean = {
+    // Without the left columns, every residual that reads a column fails the check.
+    require(residualCondition.isEmpty || leftOutput.nonEmpty, "a residual needs leftOutput")
+    SortMergeAsOfJoinScanner.supportsCursorScan(direction, asOfCondition, residualCondition,
+      AttributeSet(leftOutput), leftSortExprs, rightSortExprs)
+  }
 
   /**
    * Runs one scan with no equi-keys in a task. Returns the right key that each left row matched,
@@ -401,7 +457,7 @@ class SortMergeAsOfJoinScannerSuite extends SparkFunSuite with LocalSparkContext
 
 private object SortMergeAsOfJoinScannerSuite {
 
-  /** A buffered scanner over one INT column per side, with no equi-keys. */
+  /** A scanner over one INT column per side, with no equi-keys. It buffers by default. */
   def newScanner(
       leftKey: Attribute,
       rightKey: Attribute,
@@ -411,7 +467,8 @@ private object SortMergeAsOfJoinScannerSuite {
       residualCondition: Option[Expression] = None,
       direction: AsOfJoinDirection = Backward,
       inMemoryThreshold: Int = 256,
-      spillThreshold: Int = 256): SortMergeAsOfJoinScanner = {
+      spillThreshold: Int = 256,
+      useCursorScan: Boolean = false): SortMergeAsOfJoinScanner = {
     new SortMergeAsOfJoinScanner(
       leftIter = leftKeys.iterator.map(k => InternalRow(k)),
       rightIter = rightKeys.iterator.map(k => InternalRow(k)),
@@ -430,7 +487,7 @@ private object SortMergeAsOfJoinScannerSuite {
       inMemoryThreshold = inMemoryThreshold,
       sizeInBytesSpillThreshold = Long.MaxValue,
       spillThreshold = spillThreshold,
-      useCursorScan = false,
+      useCursorScan = useCursorScan,
       numAsOfCursorTasks = new SQLMetric("sum"))
   }
 

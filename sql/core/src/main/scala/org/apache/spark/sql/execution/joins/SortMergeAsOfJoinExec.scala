@@ -134,7 +134,7 @@ case class SortMergeAsOfJoinExec(
   /** Whether the join reads the right side once with a cursor, instead of buffering it. */
   private def cursorScanEnabled: Boolean = conf.sortMergeAsOfJoinCursorScanEnabled &&
     SortMergeAsOfJoinScanner.supportsCursorScan(
-      direction, asOfCondition, condition, leftSortExprs, rightSortExprs)
+      direction, asOfCondition, condition, left.outputSet, leftSortExprs, rightSortExprs)
 
   // Nearest joins keep the interpreted scan, as its distance compare is harder to generate. The
   // codegen config is read once, when the join is planned.
@@ -213,8 +213,9 @@ case class SortMergeAsOfJoinExec(
   /**
    * Generates the cursor scan, which reads the right side once and never steps back. The left
    * rows of a group come in ascending as-of key order, so backward keeps its best row for the
-   * next left row, and forward drops each failing row. Returns the function that finds the best
-   * right row for a left row, and the code that starts the scan.
+   * next left row, and forward drops each failing row. A residual condition then keeps or drops
+   * the row the cursor finds. Returns the function that finds the best right row for a left row,
+   * and the code that starts the scan.
    */
   private def genCursorScan(
       ctx: CodegenContext,
@@ -277,10 +278,10 @@ case class SortMergeAsOfJoinExec(
         ("", "", s"return $cursorBest;")
     }
 
-    val funcName = ctx.freshName("findWithCursor")
-    val func = ctx.addNewFunction(funcName,
+    val moveName = ctx.freshName("moveCursor")
+    val move = ctx.addNewFunction(moveName,
       s"""
-         |private UnsafeRow $funcName(InternalRow $leftRow) {
+         |private UnsafeRow $moveName(InternalRow $leftRow) {
          |  int comp = 0;
          |  $readLeftKeys
          |  ${onNewGroup(startGroup)}
@@ -312,6 +313,20 @@ case class SortMergeAsOfJoinExec(
          |  return $cursorBest;
          |}
        """.stripMargin, inlineToOuterClass = true)
+    val func = condition match {
+      case Some(cond) =>
+        val residualHolds = genConditionFunction(ctx, cond, "residualHolds")
+        val best = ctx.freshName("best")
+        val funcName = ctx.freshName("findWithCursor")
+        ctx.addNewFunction(funcName,
+          s"""
+             |private UnsafeRow $funcName(InternalRow $leftRow) {
+             |  UnsafeRow $best = $move($leftRow);
+             |  return $best == null || $residualHolds($leftRow, $best) ? $best : null;
+             |}
+           """.stripMargin, inlineToOuterClass = true)
+      case None => move
+    }
     (func, s"""
        |${metricTerm(ctx, "numAsOfCursorTasks")}.add(1);
        |$startOnlyGroup
@@ -539,7 +554,8 @@ case class SortMergeAsOfJoinExec(
  *  - Nearest: the closest eligible rows before and after the left key are compared.
  *
  * With `useCursorScan`, the scan does not buffer the group. It walks the right input once and
- * keeps only the best row so far (see [[findWithCursor]]).
+ * keeps only the best row so far, since the left rows of a group come in ascending as-of key
+ * order.
  */
 private[joins] class SortMergeAsOfJoinScanner(
     leftIter: Iterator[InternalRow],
@@ -887,14 +903,26 @@ private[joins] class SortMergeAsOfJoinScanner(
   }
 
   /**
-   * Finds the best right row for `leftRow` by moving a cursor over the right input, or null.
+   * Finds the best right row for `leftRow` with the cursor, or null. It checks the residual
+   * once, on that row, since a left-only residual has one value per left row.
+   */
+  private def findWithCursor(leftRow: InternalRow, leftKey: UnsafeRow): InternalRow = {
+    val best = moveCursor(leftRow, leftKey)
+    if (best == null || residualCondition.isEmpty) return best
+    joinedRow(leftRow, best)
+    if (residualHolds) best else null
+  }
+
+  /**
+   * Moves the cursor over the right input to the best right row for `leftRow` by the as-of
+   * condition, and returns that row, or null.
    *
    * Left rows of a group come in ascending as-of key order. So a right row that passes for one
    * left row also passes for the next (backward), and a row that fails stays failed (forward).
    * The cursor never steps back: backward stops at the first failing row and keeps it for the
    * next left row, and forward drops each failing row, since no later left row can match it.
    */
-  private def findWithCursor(leftRow: InternalRow, leftKey: UnsafeRow): InternalRow = {
+  private def moveCursor(leftRow: InternalRow, leftKey: UnsafeRow): InternalRow = {
     // Without equi-keys, all rows form one group, so only the first left row starts it.
     if (cursorGroupKey == null || equiKeyOrdering.exists(_.compare(leftKey, cursorGroupKey) != 0)) {
       startCursorGroup(leftKey)
@@ -1066,19 +1094,24 @@ private[execution] object SortMergeAsOfJoinScanner {
    * Whether the scan can read the right side once with a cursor, instead of buffering each
    * right-side group and scanning it again for every left row.
    *
-   * This needs a backward or forward join with no residual condition, whose as-of condition
-   * only compares the two sort keys. Both sides are sorted on exactly those keys, so the right
-   * rows that pass the condition move forward as the left key grows. Anything else, such as a
-   * tolerance, a tuple, or an operand cast that the sort key does not have, keeps the buffer.
+   * This needs a backward or forward join whose as-of condition only compares the two sort keys.
+   * Both sides are sorted on exactly those keys, so the right rows that pass the condition move
+   * forward as the left key grows. Anything else, such as a tolerance, a tuple, or an operand
+   * cast that the sort key does not have, keeps the buffer.
    *
    * The condition must name the left side first, since the cursor evaluates the left key first.
    * With the right side first, a NULL right key ends the condition before the left key, which
    * can fail under ANSI. Only a DataFrame join with reversed keys builds such a condition.
+   *
+   * A residual condition must be deterministic and read only `leftOutput`. It then has one value
+   * per left row, so the scan checks it once, on the best row. The scan skips it when the cursor
+   * finds no row, since a residual runs only on right rows that pass the as-of condition.
    */
   def supportsCursorScan(
       direction: AsOfJoinDirection,
       asOfCondition: Expression,
       residualCondition: Option[Expression],
+      leftOutput: AttributeSet,
       leftSortExprs: Seq[Expression],
       rightSortExprs: Seq[Expression]): Boolean = {
     // The operands as (left, right): backward needs left >= right, forward left <= right.
@@ -1091,7 +1124,7 @@ private[execution] object SortMergeAsOfJoinScanner {
     }
     (leftSortExprs, rightSortExprs, operands) match {
       case (Seq(leftKey), Seq(rightKey), Some((leftOperand, rightOperand))) =>
-        residualCondition.isEmpty &&
+        residualCondition.forall(c => c.deterministic && c.references.subsetOf(leftOutput)) &&
           leftOperand.semanticEquals(leftKey) &&
           rightOperand.semanticEquals(rightKey) &&
           leftKey.dataType == rightKey.dataType &&

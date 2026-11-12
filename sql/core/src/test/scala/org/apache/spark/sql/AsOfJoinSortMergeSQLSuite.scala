@@ -25,8 +25,8 @@ import org.apache.spark.SparkThrowable
 import org.apache.spark.sql.catalyst.expressions.{Cast, CodegenObjectFactoryMode}
 import org.apache.spark.sql.catalyst.plans.{AsOfJoinDirection, Backward, Forward, Nearest}
 import org.apache.spark.sql.catalyst.plans.logical.AsOfJoin
-import org.apache.spark.sql.execution.{FileSourceScanExec, InputAdapter, SparkPlan,
-  WholeStageCodegenExec}
+import org.apache.spark.sql.execution.{FileSourceScanExec, InputAdapter, ScalarSubquery,
+  SparkPlan, WholeStageCodegenExec}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.joins.SortMergeAsOfJoinExec
 import org.apache.spark.sql.internal.SQLConf
@@ -1701,7 +1701,7 @@ class AsOfJoinSortMergeSQLSuite extends QueryTest
     withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
       Seq(
         ("", true),
-        // A residual ON condition keeps the buffered scan.
+        // A residual that reads a right column keeps the buffered scan.
         (" AND t.id + 1 > q.id", false)
       ).foreach { case (residual, cursorScan) =>
         withClue(s"cursor scan $cursorScan: ") {
@@ -2080,7 +2080,8 @@ class AsOfJoinSortMergeSQLSuite extends QueryTest
       Row(1, "cheap") :: Nil)
   }
 
-  test("cursor scan: a residual ON predicate keeps the buffered scan") {
+  test("cursor scan: a residual ON predicate that reads a right column keeps the buffered " +
+      "scan") {
     withSQLConf(
         SQLConf.SORT_MERGE_JOIN_EXEC_BUFFER_IN_MEMORY_THRESHOLD.key -> "1",
         SQLConf.SORT_MERGE_JOIN_EXEC_BUFFER_SPILL_THRESHOLD.key -> "1") {
@@ -2098,17 +2099,196 @@ class AsOfJoinSortMergeSQLSuite extends QueryTest
       checkBufferedScan(twoSided, Row(1, "cheap") :: Nil)
       assert(asOfJoinMetric(twoSided, "spillSize") > 0)
 
-      // A LEFT ASOF JOIN keeps a left-only ON predicate in the join.
+      // A predicate with a left-only part and a part that reads q keeps the buffered scan.
       checkBufferedScan(
         sql(
           """
             |SELECT t.id, q.tag
-            |FROM VALUES (1, 'A', 10, true), (2, 'A', 12, false) AS t(id, sym, ts, active)
-            |LEFT ASOF JOIN VALUES ('A', 1, 'q1'), ('A', 5, 'q5') AS q(sym, ts, tag)
+            |FROM VALUES (1, 'A', 10, 100, true), (2, 'A', 12, 100, false)
+            |  AS t(id, sym, ts, max_price, active)
+            |LEFT ASOF JOIN VALUES ('A', 1, 50, 'cheap'), ('A', 5, 500, 'pricey')
+            |  AS q(sym, ts, price, tag)
             |  MATCH_CONDITION (t.ts >= q.ts)
-            |  ON t.sym = q.sym AND t.active
+            |  ON t.sym = q.sym AND t.active AND q.price <= t.max_price
             |""".stripMargin),
-        Row(1, "q5") :: Row(2, null) :: Nil)
+        Row(1, "cheap") :: Row(2, null) :: Nil)
+    }
+  }
+
+  test("cursor scan: a left-only ON predicate of a LEFT ASOF JOIN keeps the cursor scan") {
+    // A LEFT ASOF JOIN keeps the predicate in the join, since it keeps every left row. Trades 2,
+    // 3 and 5 fail it, by FALSE or NULL, so they get no quote. The scan must still keep the best
+    // quote of a failing trade, since trade 4 needs it too.
+    Seq(">=" -> Seq("a1", null, null, "a5", null, null),
+        "<=" -> Seq("a3", null, null, "a8", null, null)).foreach { case (op, tags) =>
+      withClue(s"$op: ") {
+        checkCursorScan(
+          sql(
+            s"""
+               |SELECT t.id, q.tag
+               |FROM VALUES (1, 'A', 2, 150), (2, 'A', 4, 50), (3, 'A', 6, NULL), (4, 'A', 7, 200),
+               |  (5, 'B', 3, 50), (6, 'C', 5, 150) AS t(id, sym, ts, qty)
+               |LEFT ASOF JOIN VALUES ('A', 1, 'a1'), ('A', 3, 'a3'), ('A', 5, 'a5'),
+               |  ('A', 8, 'a8'), ('B', 1, 'b1'), ('B', 4, 'b4') AS q(sym, ts, tag)
+               |  MATCH_CONDITION (t.ts $op q.ts)
+               |  ON t.sym = q.sym AND t.qty > 100
+               |""".stripMargin),
+          tags.zipWithIndex.map { case (tag, i) => Row(i + 1, tag) })
+      }
+    }
+  }
+
+  test("cursor scan: an ON predicate that reads no column") {
+    // An uncorrelated scalar subquery is not folded, so the predicate reaches the join. It has one
+    // value for the query, so the cursor scan checks it once per trade with a candidate quote.
+    Seq(100 -> Seq("a1", "a5"), 200 -> Seq(null, null)).foreach { case (limit, tags) =>
+      withClue(s"limit $limit: ") {
+        def query: DataFrame = sql(
+          s"""
+             |SELECT t.id, q.tag
+             |FROM VALUES (1, 'A', 2), (2, 'A', 6) AS t(id, sym, ts)
+             |LEFT ASOF JOIN VALUES ('A', 1, 'a1'), ('A', 5, 'a5') AS q(sym, ts, tag)
+             |  MATCH_CONDITION (t.ts >= q.ts)
+             |  ON t.sym = q.sym AND (SELECT max(v) FROM VALUES (150) AS l(v)) > $limit
+             |""".stripMargin)
+        val plan = query.queryExecution.executedPlan
+        val conditions = collect(plan) { case j: SortMergeAsOfJoinExec => j.condition }
+        assert(conditions.size == 1 && conditions.head.exists { condition =>
+          condition.references.isEmpty && condition.exists(_.isInstanceOf[ScalarSubquery])
+        }, s"Expected a residual with a scalar subquery and no column in plan:\n$plan")
+        checkCursorScan(query, tags.zipWithIndex.map { case (tag, i) => Row(i + 1, tag) })
+      }
+    }
+  }
+
+  test("cursor scan: a left-only ON predicate with no ON key") {
+    // Without an ON key, all rows form one group. Trade 1 has no candidate quote, and trades 3
+    // and 4 fail the predicate. Trade 5 needs the best quote of trade 4.
+    Seq(">=" -> Seq(null, "q1", null, null, "q5"),
+        "<=" -> Seq(null, "q3", null, null, "q8")).foreach { case (op, tags) =>
+      withClue(s"$op: ") {
+        val noCandidateTs = if (op == ">=") 0 else 9
+        checkCursorScan(
+          sql(
+            s"""
+               |SELECT t.id, q.tag
+               |FROM VALUES (1, $noCandidateTs, 150), (2, 2, 150), (3, 4, 50), (4, 6, NULL),
+               |  (5, 7, 200) AS t(id, ts, qty)
+               |LEFT ASOF JOIN VALUES (1, 'q1'), (3, 'q3'), (5, 'q5'), (8, 'q8') AS q(ts, tag)
+               |  MATCH_CONDITION (t.ts $op q.ts)
+               |  ON t.qty > 100
+               |""".stripMargin),
+          tags.zipWithIndex.map { case (tag, i) => Row(i + 1, tag) })
+      }
+    }
+  }
+
+  test("cursor scan: a left-only ON predicate that calls raise_error stays in an INNER join") {
+    // An INNER ASOF JOIN pushes a left-only predicate down, except a throwable one, such as one
+    // that calls raise_error. Trades 5 and 6 have no candidate quote, so the predicate must not
+    // run on them and raise the error.
+    Seq((">=", 0, Seq(Row(1, "a1"), Row(4, "a5"))),
+        ("<=", 9, Seq(Row(1, "a3"), Row(4, "a8")))).foreach { case (op, noCandidateTs, expected) =>
+      withClue(s"$op: ") {
+        checkCursorScan(
+          sql(
+            s"""
+               |SELECT t.id, q.tag
+               |FROM VALUES (1, 'A', 2, 150), (2, 'A', 4, 50), (3, 'A', 6, NULL), (4, 'A', 7, 200),
+               |  (5, 'A', $noCandidateTs, -1), (6, 'C', 5, -1) AS t(id, sym, ts, qty)
+               |ASOF JOIN VALUES ('A', 1, 'a1'), ('A', 3, 'a3'), ('A', 5, 'a5'), ('A', 8, 'a8')
+               |  AS q(sym, ts, tag)
+               |  MATCH_CONDITION (t.ts $op q.ts)
+               |  ON t.sym = q.sym AND IF(t.qty < 0, raise_error('negative quantity'), t.qty > 100)
+               |""".stripMargin),
+          expected)
+      }
+    }
+  }
+
+  test("cursor scan: a left-only ON predicate runs once per trade with a candidate quote, " +
+      "generated or not") {
+    // counted(x) returns x and counts its calls. Trade 1 has no candidate quote, and trades 2, 3
+    // and 4 have 3, 6 and 9. The buffered scan checks the predicate on each candidate it reads,
+    // and a forward scan stops at the first match.
+    val calls = sparkContext.longAccumulator("calls")
+    withUserDefinedFunction("counted" -> true) {
+      spark.udf.register("counted", (x: Int) => { calls.add(1); x })
+      for {
+        (op, times, tag, bufferedCalls) <-
+          Seq((">=", Seq(0, 3, 6, 9), "q6", 18), ("<=", Seq(11, 8, 5, 2), "q5", 13))
+        cursorScan <- Seq(false, true)
+      } {
+        withClue(s"$op, cursor scan $cursorScan: ") {
+          withSQLConf(
+              SQLConf.SORT_MERGE_AS_OF_JOIN_CURSOR_SCAN_ENABLED.key -> cursorScan.toString) {
+            checkWithAsOfJoinCodegenOffAndOn(
+              sql(
+                s"""
+                   |SELECT t.id, q.tag
+                   |FROM VALUES (1, 'A', ${times(0)}, 200), (2, 'A', ${times(1)}, 50),
+                   |  (3, 'A', ${times(2)}, 200), (4, 'A', ${times(3)}, 50) AS t(id, sym, ts, qty)
+                   |LEFT ASOF JOIN (SELECT 'A' AS sym, CAST(id AS INT) AS ts, concat('q', id) AS tag
+                   |  FROM range(1, 11)) q
+                   |  MATCH_CONDITION (t.ts $op q.ts)
+                   |  ON t.sym = q.sym AND counted(t.qty) > 100
+                   |""".stripMargin)) { df =>
+              // One run only, since each run counts again.
+              calls.reset()
+              val tags = df.collect().map(row => row.getInt(0) -> row.getString(1)).sorted.toSeq
+              assert(tags == Seq(1 -> null, 2 -> null, 3 -> tag, 4 -> null))
+              assert(calls.value == (if (cursorScan) 3 else bufferedCalls))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("cursor scan: a left-only ON predicate runs only for trades with a candidate quote") {
+    // Under ANSI, 10 / t.d fails for d = 0. Trade 2 has quotes, but none passes the
+    // MATCH_CONDITION. Trade 3 has a NULL time, and trade 4 has no quotes. So none of them
+    // checks the predicate, and the query must not fail.
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      Seq(">=" -> (6, 4), "<=" -> (4, 6)).foreach { case (op, (matchTs, noMatchTs)) =>
+        withClue(s"$op: ") {
+          checkCursorScan(
+            sql(
+              s"""
+                 |SELECT t.id, q.tag
+                 |FROM VALUES (1, 'A', $matchTs, 2), (2, 'A', $noMatchTs, 0), (3, 'B', NULL, 0),
+                 |  (4, 'C', 6, 0) AS t(id, sym, ts, d)
+                 |LEFT ASOF JOIN VALUES ('A', 5, 'a5'), ('B', 5, 'b5') AS q(sym, ts, tag)
+                 |  MATCH_CONDITION (t.ts $op q.ts)
+                 |  ON t.sym = q.sym AND 10 / t.d > 1
+                 |""".stripMargin),
+            Row(1, "a5") :: Row(2, null) :: Row(3, null) :: Row(4, null) :: Nil)
+
+          // A trade with a candidate quote checks the predicate, so d = 0 fails the query. With
+          // d = 2, the same query passes and uses the cursor scan.
+          def oneTrade(d: Int): DataFrame = sql(
+            s"""
+               |SELECT t.id, q.tag
+               |FROM VALUES (1, 'A', $matchTs, $d) AS t(id, sym, ts, d)
+               |LEFT ASOF JOIN VALUES ('A', 5, 'a5') AS q(sym, ts, tag)
+               |  MATCH_CONDITION (t.ts $op q.ts)
+               |  ON t.sym = q.sym AND 10 / t.d > 1
+               |""".stripMargin)
+          checkCursorScan(oneTrade(2), Row(1, "a5") :: Nil)
+          for (cursorScan <- Seq(false, true); codegen <- Seq(false, true)) {
+            withClue(s"cursor scan $cursorScan, codegen $codegen: ") {
+              withSQLConf(
+                  SQLConf.SORT_MERGE_AS_OF_JOIN_CURSOR_SCAN_ENABLED.key -> cursorScan.toString,
+                  SQLConf.ENABLE_SORT_MERGE_AS_OF_JOIN_CODEGEN.key -> codegen.toString) {
+                val e = intercept[RuntimeException] {
+                  oneTrade(0).collect()
+                }
+                assert(e.asInstanceOf[SparkThrowable].getCondition == "DIVIDE_BY_ZERO", e)
+              }
+            }
+          }
+        }
+      }
     }
   }
 
